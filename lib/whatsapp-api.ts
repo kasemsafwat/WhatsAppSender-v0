@@ -1,5 +1,3 @@
-// WhatsApp Business API implementation
-
 interface SendMessageParams {
   to: string
   message: string
@@ -28,7 +26,7 @@ interface BulkMessageResponse {
   }>
 }
 
-// Function to send a WhatsApp message using the Business API
+// Function to send a WhatsApp message using Ultramsg API
 export async function sendWhatsAppMessage({ to, message, mediaUrl }: SendMessageParams): Promise<MessageResponse> {
   try {
     const response = await fetch("/api/whatsapp/send", {
@@ -50,7 +48,7 @@ export async function sendWhatsAppMessage({ to, message, mediaUrl }: SendMessage
 
     const data = await response.json()
     return {
-      id: data.messages?.[0]?.id || "unknown",
+      id: data.id || "unknown",
       status: "sent",
     }
   } catch (error) {

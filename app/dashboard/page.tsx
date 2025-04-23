@@ -12,16 +12,45 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useToast } from "@/hooks/use-toast"
-import { Loader2, Send, X, RefreshCw, ImageIcon, FileText, AlertTriangle } from "lucide-react"
+import { Loader2, Send, X, RefreshCw, ImageIcon, FileText, CheckCircle, AlertTriangle, CreditCard } from "lucide-react"
 import { sendWhatsAppMessage, sendWhatsAppBulkMessages } from "@/lib/whatsapp-api"
 import { uploadWhatsAppMedia } from "@/lib/whatsapp-media-api"
+import { config } from "@/lib/config"
 
-// Flag to indicate if we're in mock mode
-const IS_MOCK_MODE = true // This should match the setting in your API routes
+// Add this function near the top of the file, after the imports
+function formatErrorMessage(error: any): string {
+  if (typeof error === "string") {
+    return error
+  }
+
+  if (error instanceof Error) {
+    return error.message
+  }
+
+  // Check for the specific payment error
+  if (
+    error?.code === "PAYMENT_REQUIRED" ||
+    (error?.error && typeof error.error === "string" && error.error.includes("non-payment"))
+  ) {
+    return "Your Ultramsg account is inactive due to non-payment. Please renew your subscription."
+  }
+
+  if (error?.error) {
+    // Handle API error responses
+    return typeof error.error === "string" ? error.error : JSON.stringify(error.error)
+  }
+
+  return "An unknown error occurred"
+}
+
+// Flag to indicate if we're in simulation mode - this will be updated from config
+const IS_SIMULATION_MODE = config.whatsapp.useSimulationMode
 
 // Country codes for WhatsApp
 const countryCodes = [
-  { code: "1", country: "United States" },
+  { code: "2", country: "Egypt" },
+  { code: "966", country: "Saudi Arabia" },
+  /*   { code: "1", country: "United States" },
   { code: "44", country: "United Kingdom" },
   { code: "91", country: "India" },
   { code: "55", country: "Brazil" },
@@ -40,8 +69,8 @@ const countryCodes = [
   { code: "27", country: "South Africa" },
   { code: "234", country: "Nigeria" },
   { code: "254", country: "Kenya" },
-  { code: "61", country: "Australia" },
-]
+  { code: "61", country: "Australia" }, */
+];
 
 // Message templates
 const messageTemplates = [
@@ -66,6 +95,9 @@ export default function DashboardPage() {
   const [sendingProgress, setSendingProgress] = useState(0)
   const [isSending, setIsSending] = useState(false)
   const [uploadedImageUrl, setUploadedImageUrl] = useState<string | null>(null)
+  const [uploadError, setUploadError] = useState<string | null>(null)
+  const [isSimulationMode, setIsSimulationMode] = useState(IS_SIMULATION_MODE)
+  const [paymentRequired, setPaymentRequired] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const router = useRouter()
   const { toast } = useToast()
@@ -104,6 +136,7 @@ export default function DashboardPage() {
       const file = e.target.files[0]
       setSelectedFile(file)
       setIsLoading(true)
+      setUploadError(null)
 
       // Create preview URL for image
       if (file.type.startsWith("image/")) {
@@ -114,18 +147,47 @@ export default function DashboardPage() {
         reader.readAsDataURL(file)
 
         try {
-          // Upload the image to WhatsApp Media API
-          const uploadResult = await uploadWhatsAppMedia(file)
-          setUploadedImageUrl(uploadResult.url)
+          // Check file size
+          if (file.size > 5 * 1024 * 1024) {
+            // 5MB limit
+            throw new Error("File size exceeds 5MB limit. Please choose a smaller image.")
+          }
 
-          toast({
-            title: "Image uploaded",
-            description: IS_MOCK_MODE
-              ? "Mock mode: Image simulated as uploaded successfully"
-              : "Your image has been uploaded and is ready to be sent.",
-          })
+          console.log("Starting file upload process for:", file.name)
+
+          // For Ultramsg, we can use the data URL directly
+          try {
+            console.log("Preparing image for Ultramsg...")
+            const uploadResult = await uploadWhatsAppMedia(file)
+            setUploadedImageUrl(uploadResult.url)
+            console.log("Image prepared successfully:", uploadResult)
+
+            // Check if this was a simulated response
+            if (uploadResult.simulation) {
+              setIsSimulationMode(true)
+            }
+
+            toast({
+              title: "Image ready",
+              description: isSimulationMode
+                ? "Your image is ready (simulation mode)"
+                : "Your image is ready to be sent with Ultramsg.",
+            })
+          } catch (uploadError) {
+            console.error("Image preparation failed:", uploadError)
+
+            // Fallback to using the preview URL directly
+            console.log("Falling back to using preview URL...")
+            setUploadedImageUrl(reader.result as string)
+
+            toast({
+              title: "Using local image",
+              description: "Using local image preview for sending.",
+            })
+          }
         } catch (error) {
-          console.error("Upload error:", error)
+          console.error("File handling error:", error)
+          setUploadError(error instanceof Error ? error.message : "Unknown error occurred")
           toast({
             title: "Upload failed",
             description: error instanceof Error ? error.message : "Failed to upload image. Please try again.",
@@ -138,6 +200,7 @@ export default function DashboardPage() {
       } else {
         setPreviewUrl(null)
         setIsLoading(false)
+        setUploadError("Invalid file type. Please select an image file.")
         toast({
           title: "Invalid file type",
           description: "Please select an image file.",
@@ -152,6 +215,7 @@ export default function DashboardPage() {
     setSelectedFile(null)
     setPreviewUrl(null)
     setUploadedImageUrl(null)
+    setUploadError(null)
     if (fileInputRef.current) {
       fileInputRef.current.value = ""
     }
@@ -223,6 +287,7 @@ export default function DashboardPage() {
 
     setIsSending(true)
     setSendingProgress(0)
+    setPaymentRequired(false)
 
     try {
       // Example of sending messages in sequence with progress updates
@@ -235,29 +300,65 @@ export default function DashboardPage() {
           setMessageStatus((prev) => ({ ...prev, [recipient]: "pending" }))
 
           // Call the WhatsApp API function
-          await sendWhatsAppMessage({
+          const result = await sendWhatsAppMessage({
             to: fullNumber,
             message: message,
             mediaUrl: uploadedImageUrl,
           })
 
+          // Check if this was a simulated response
+          if (result.simulation) {
+            setIsSimulationMode(true)
+
+            // Check if this was due to a payment issue
+            if (result.paymentRequired) {
+              setPaymentRequired(true)
+            }
+          }
+
           // Update status to indicate success
           setMessageStatus((prev) => ({ ...prev, [recipient]: "sent" }))
 
           toast({
-            title: IS_MOCK_MODE ? "Mock message sent" : "Message sent",
-            description: `Message ${IS_MOCK_MODE ? "simulated as " : ""}successfully sent to +${countryCode} ${recipient}`,
+            title: isSimulationMode ? "Message simulated" : "Message sent",
+            description: `Message ${isSimulationMode ? "simulated" : "sent"} to +${countryCode} ${recipient}`,
           })
         } catch (error) {
+          // Check if this is a payment error and update simulation mode
+          if (
+            error &&
+            typeof error === "object" &&
+            (("code" in error && error.code === "PAYMENT_REQUIRED") ||
+              ("error" in error && typeof error.error === "string" && error.error.includes("non-payment")))
+          ) {
+            setIsSimulationMode(true)
+            setPaymentRequired(true)
+
+            toast({
+              title: "Ultramsg Payment Required",
+              description:
+                "Your Ultramsg instance has been stopped due to non-payment. Please renew your subscription.",
+              variant: "destructive",
+            })
+
+            // Update all remaining recipients to failed
+            const updatedStatus = { ...messageStatus }
+            processedRecipients.slice(i).forEach((num) => {
+              updatedStatus[num] = "failed"
+            })
+            setMessageStatus(updatedStatus)
+
+            // Set progress to 100% since we're stopping
+            setSendingProgress(100)
+            break
+          }
+
           // Update status to indicate failure
           setMessageStatus((prev) => ({ ...prev, [recipient]: "failed" }))
 
           toast({
             title: "Send failed",
-            description:
-              error instanceof Error
-                ? `Failed to send to +${countryCode} ${recipient}: ${error.message}`
-                : `Failed to send to +${countryCode} ${recipient}`,
+            description: `Failed to send to +${countryCode} ${recipient}: ${formatErrorMessage(error)}`,
             variant: "destructive",
           })
         }
@@ -271,15 +372,16 @@ export default function DashboardPage() {
         }
       }
 
-      toast({
-        title: "Process complete",
-        description: `Attempted to send messages to ${processedRecipients.length} recipients.`,
-      })
+      if (!paymentRequired) {
+        toast({
+          title: "Process complete",
+          description: `Attempted to send messages to ${processedRecipients.length} recipients.`,
+        })
+      }
     } catch (error) {
       toast({
         title: "Error",
-        description:
-          error instanceof Error ? `An error occurred: ${error.message}` : "An error occurred while sending messages.",
+        description: formatErrorMessage(error),
         variant: "destructive",
       })
     } finally {
@@ -299,6 +401,7 @@ export default function DashboardPage() {
 
     setIsSending(true)
     setSendingProgress(0)
+    setPaymentRequired(false)
 
     try {
       // Format numbers with country code
@@ -317,6 +420,16 @@ export default function DashboardPage() {
         message: message,
         mediaUrl: uploadedImageUrl,
       })
+
+      // Check if this was a simulated response
+      if (result.simulation) {
+        setIsSimulationMode(true)
+
+        // Check if this was due to a payment issue
+        if (result.paymentRequired) {
+          setPaymentRequired(true)
+        }
+      }
 
       // Update statuses based on the response
       if (result.details) {
@@ -347,21 +460,78 @@ export default function DashboardPage() {
       setSendingProgress(100)
 
       toast({
-        title: IS_MOCK_MODE ? "Mock bulk send complete" : "Bulk send complete",
-        description: `${IS_MOCK_MODE ? "Simulated results: " : ""}Successfully sent: ${result.successful}, Failed: ${result.failed}`,
+        title: isSimulationMode ? "Bulk simulation complete" : "Bulk send complete",
+        description: `Successfully ${isSimulationMode ? "simulated" : "sent"}: ${result.successful}, Failed: ${result.failed}`,
         variant: result.failed > 0 ? "destructive" : "default",
       })
     } catch (error) {
-      toast({
-        title: "Bulk send failed",
-        description:
-          error instanceof Error
-            ? `Failed to send messages: ${error.message}`
-            : "Failed to send messages. Please try again.",
-        variant: "destructive",
-      })
+      // Check if this is a payment error and update simulation mode
+      if (
+        error &&
+        typeof error === "object" &&
+        (("code" in error && error.code === "PAYMENT_REQUIRED") ||
+          ("error" in error && typeof error.error === "string" && error.error.includes("non-payment")))
+      ) {
+        setIsSimulationMode(true)
+        setPaymentRequired(true)
+
+        toast({
+          title: "Ultramsg Payment Required",
+          description: "Your Ultramsg instance has been stopped due to non-payment. Please renew your subscription.",
+          variant: "destructive",
+        })
+
+        // Mark all as failed
+        const failedStatus: Record<string, "pending" | "sent" | "failed"> = {}
+        processedRecipients.forEach((num) => {
+          failedStatus[num] = "failed"
+        })
+        setMessageStatus(failedStatus)
+      } else {
+        toast({
+          title: "Bulk send failed",
+          description: formatErrorMessage(error),
+          variant: "destructive",
+        })
+      }
     } finally {
       setIsSending(false)
+    }
+  }
+
+  const handleRenewSubscription = () => {
+    window.open("https://ultramsg.com/", "_blank")
+  }
+
+  const testConnection = async () => {
+    try {
+      toast({
+        title: "Testing connection",
+        description: "Checking connection to Ultramsg API...",
+      })
+
+      const response = await fetch("/api/whatsapp/test-connection")
+      const data = await response.json()
+
+      if (data.status === "success") {
+        toast({
+          title: "Connection successful",
+          description: "Successfully connected to Ultramsg API.",
+        })
+        console.log("Connection test result:", data)
+      } else {
+        toast({
+          title: "Connection failed",
+          description: data.error || "Failed to connect to Ultramsg API",
+          variant: "destructive",
+        })
+      }
+    } catch (error) {
+      toast({
+        title: "Connection test error",
+        description: error instanceof Error ? error.message : "An error occurred",
+        variant: "destructive",
+      })
     }
   }
 
@@ -373,7 +543,7 @@ export default function DashboardPage() {
     <div className="flex min-h-screen flex-col">
       <header className="px-4 lg:px-6 h-14 flex items-center border-b">
         <div className="flex items-center justify-center">
-          <span className="text-xl font-bold">WhatsApp Business Sender</span>
+          <span className="text-xl font-bold">WhatsApp Sender (Ultramsg)</span>
         </div>
         <nav className="ml-auto flex gap-4 sm:gap-6">
           <span className="text-sm font-medium">Welcome, {user.name || user.email}</span>
@@ -385,14 +555,50 @@ export default function DashboardPage() {
       <main className="flex-1 py-6">
         <div className="container px-4 md:px-6">
           <div className="mx-auto max-w-4xl space-y-6">
-            {IS_MOCK_MODE && (
-              <div className="bg-yellow-50 border border-yellow-200 rounded-md p-4 flex items-start gap-3">
-                <AlertTriangle className="h-5 w-5 text-yellow-500 mt-0.5" />
+            {/* Status Banners */}
+            {paymentRequired && (
+              <div className="bg-red-50 border border-red-200 rounded-md p-4 flex items-start gap-3">
+                <CreditCard className="h-5 w-5 text-red-500 mt-0.5" />
                 <div>
-                  <h3 className="font-medium text-yellow-800">Mock Mode Active</h3>
-                  <p className="text-sm text-yellow-700 mt-1">
-                    The application is running in mock mode. No real messages will be sent. This is perfect for testing
-                    the UI and workflow.
+                  <h3 className="font-medium text-red-800">Ultramsg Payment Required</h3>
+                  <p className="text-sm text-red-700 mt-1">
+                    Your Ultramsg instance has been stopped due to non-payment. Please renew your subscription to send
+                    real messages.
+                  </p>
+                  <div className="mt-3">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="bg-white text-red-600 border-red-300 hover:bg-red-50"
+                      onClick={handleRenewSubscription}
+                    >
+                      <CreditCard className="h-4 w-4 mr-2" />
+                      Renew Subscription
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {isSimulationMode && !paymentRequired && (
+              <div className="bg-amber-50 border border-amber-200 rounded-md p-4 flex items-start gap-3">
+                <AlertTriangle className="h-5 w-5 text-amber-500 mt-0.5" />
+                <div>
+                  <h3 className="font-medium text-amber-800">Simulation Mode Active</h3>
+                  <p className="text-sm text-amber-700 mt-1">
+                    The application is running in simulation mode. Messages will be simulated but not actually sent.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {!isSimulationMode && !paymentRequired && (
+              <div className="bg-green-50 border border-green-200 rounded-md p-4 flex items-start gap-3">
+                <CheckCircle className="h-5 w-5 text-green-500 mt-0.5" />
+                <div>
+                  <h3 className="font-medium text-green-800">Ultramsg API Active</h3>
+                  <p className="text-sm text-green-700 mt-1">
+                    The application is configured to send real WhatsApp messages using Ultramsg API with your token.
                   </p>
                 </div>
               </div>
@@ -476,8 +682,11 @@ export default function DashboardPage() {
                               alt="Preview"
                               className="max-h-40 rounded-md border"
                             />
-                            {uploadedImageUrl && (
-                              <p className="text-xs text-green-600 mt-1">✓ Image uploaded and ready to send</p>
+                            {uploadedImageUrl && !uploadError && (
+                              <p className="text-xs text-green-600 mt-1">✓ Image ready to send</p>
+                            )}
+                            {uploadError && (
+                              <p className="text-xs text-red-600 mt-1">⚠️ {uploadError} (Using preview image instead)</p>
                             )}
                           </div>
                         )}
@@ -560,7 +769,11 @@ export default function DashboardPage() {
                 <Card>
                   <CardHeader>
                     <CardTitle>Send WhatsApp Messages</CardTitle>
-                    <CardDescription>Send your message to all recipients</CardDescription>
+                    <CardDescription>
+                      {isSimulationMode
+                        ? "Simulate sending your message to all recipients"
+                        : "Send your message to all recipients"}
+                    </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-4">
                     <div className="p-4 border rounded-md bg-gray-50">
@@ -599,12 +812,12 @@ export default function DashboardPage() {
                         {isSending ? (
                           <>
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                            Sending...
+                            {isSimulationMode ? "Simulating..." : "Sending..."}
                           </>
                         ) : (
                           <>
                             <Send className="mr-2 h-4 w-4" />
-                            Send Sequentially
+                            {isSimulationMode ? "Simulate Sequentially" : "Send Sequentially"}
                           </>
                         )}
                       </Button>
@@ -618,12 +831,12 @@ export default function DashboardPage() {
                         {isSending ? (
                           <>
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                            Sending...
+                            {isSimulationMode ? "Simulating..." : "Sending..."}
                           </>
                         ) : (
                           <>
                             <Send className="mr-2 h-4 w-4" />
-                            Send in Bulk
+                            {isSimulationMode ? "Simulate in Bulk" : "Send in Bulk"}
                           </>
                         )}
                       </Button>
@@ -656,7 +869,9 @@ export default function DashboardPage() {
                               }`}
                             >
                               {messageStatus[recipient] === "sent"
-                                ? "Sent"
+                                ? isSimulationMode
+                                  ? "Simulated"
+                                  : "Sent"
                                 : messageStatus[recipient] === "failed"
                                   ? "Failed"
                                   : "Pending"}
@@ -681,30 +896,73 @@ export default function DashboardPage() {
 
             <Card>
               <CardHeader>
-                <CardTitle>About WhatsApp Business API</CardTitle>
+                <CardTitle>About Ultramsg API</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2">
                 <p className="text-sm text-muted-foreground">
-                  This application uses the WhatsApp Business API to send messages. The API allows businesses to send
-                  messages to customers who have opted in to receive communications.
+                  This application uses the Ultramsg API to send WhatsApp messages. Ultramsg is a third-party service
+                  that provides an interface to the WhatsApp platform.
                 </p>
                 <p className="text-sm text-muted-foreground">
-                  Messages are sent through an approved WhatsApp Business Solution Provider. All messages must comply
-                  with WhatsApp's Business Policy and Messaging Guidelines.
+                  Messages are sent through your connected WhatsApp account. All messages must comply with WhatsApp's
+                  Business Policy and Messaging Guidelines.
                 </p>
-                {IS_MOCK_MODE && (
-                  <div className="mt-4 p-3 bg-gray-50 border rounded-md">
-                    <p className="text-sm font-medium">Mock Mode Information</p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      The application is currently running in mock mode, which simulates WhatsApp API responses without
-                      making actual API calls. This is useful for testing the UI and workflow without consuming your API
-                      quota or sending real messages.
+
+                {paymentRequired && (
+                  <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md">
+                    <p className="text-sm font-medium">Ultramsg Payment Required</p>
+                    <p className="text-xs text-red-700 mt-1">
+                      Your Ultramsg instance has been stopped due to non-payment. Please renew your subscription to send
+                      real messages.
                     </p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      To switch to production mode, set the USE_MOCK_MODE flag to false in your API route files.
+                    <p className="text-xs text-red-700 mt-1">
+                      Visit the Ultramsg website to manage your subscription and reactivate your instance.
+                    </p>
+                    <div className="mt-3">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="bg-white text-red-600 border-red-300 hover:bg-red-50"
+                        onClick={handleRenewSubscription}
+                      >
+                        <CreditCard className="h-4 w-4 mr-2" />
+                        Renew Subscription
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {isSimulationMode && !paymentRequired && (
+                  <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-md">
+                    <p className="text-sm font-medium">Simulation Mode Information</p>
+                    <p className="text-xs text-amber-700 mt-1">
+                      The application is currently running in simulation mode. Messages will be simulated but not
+                      actually sent.
+                    </p>
+                    <p className="text-xs text-amber-700 mt-1">
+                      To send real messages, update the configuration to disable simulation mode and ensure your
+                      Ultramsg account is active.
                     </p>
                   </div>
                 )}
+
+                {!isSimulationMode && !paymentRequired && (
+                  <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded-md">
+                    <p className="text-sm font-medium">Ultramsg API Information</p>
+                    <p className="text-xs text-green-700 mt-1">
+                      The application is currently configured to send real WhatsApp messages via Ultramsg.
+                    </p>
+                    <p className="text-xs text-green-700 mt-1">
+                      Make sure your Ultramsg instance is properly configured and active.
+                    </p>
+                  </div>
+                )}
+                <div className="mt-4">
+                  <Button onClick={testConnection} variant="outline" size="sm">
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Test Ultramsg Connection
+                  </Button>
+                </div>
               </CardContent>
             </Card>
           </div>
@@ -713,7 +971,7 @@ export default function DashboardPage() {
       <footer className="border-t py-6 px-4 md:px-6">
         <div className="container flex flex-col items-center justify-center gap-4 md:flex-row">
           <p className="text-center text-sm leading-loose text-muted-foreground md:text-left">
-            © 2023 WhatsApp Business Sender. All rights reserved.
+            © 2023 WhatsApp Sender. All rights reserved.
           </p>
         </div>
       </footer>
